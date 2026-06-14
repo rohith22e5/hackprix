@@ -1280,7 +1280,27 @@ async def list_categories_endpoint():
     return await ProductCategory.find(ProductCategory.is_active == True).to_list()
 
 
-@api_router.get("/marketplace/products/", response_model=List[Product])
+def _serialize_product(p: Product) -> dict:
+    return {
+        "id": str(p.id),
+        "name": p.name,
+        "description": p.description or "",
+        "product_type": p.product_type,
+        "points_price": p.points_price,
+        "stock": p.stock,
+        "is_digital": p.is_digital,
+        "digital_file_path": p.digital_file_path,
+        "external_url": str(p.external_url) if p.external_url else None,
+        "thumbnail": p.thumbnail,
+        "metadata": p.metadata,
+        "is_active": p.is_active,
+        "featured": p.featured,
+        "created_at": p.created_at.isoformat(),
+        "updated_at": p.updated_at.isoformat(),
+    }
+
+
+@api_router.get("/marketplace/products/")
 async def list_products_endpoint(
     search: Optional[str] = Query(None),
     ordering: Optional[str] = Query(None)
@@ -1307,20 +1327,37 @@ async def list_products_endpoint(
 
         products.sort(key=get_sort_key, reverse=reverse)
 
-    return products
+    return [_serialize_product(p) for p in products]
 
 
-@api_router.get("/marketplace/products/{product_id}/", response_model=Product)
+@api_router.get("/marketplace/products/{product_id}/")
 async def get_product_detail_endpoint(product_id: str):
     product = await Product.get(product_id)
     if not product or not product.is_active:
         raise HTTPException(status_code=404, detail="Product not found")
-    return product
+    return _serialize_product(product)
+
+
+def _link_id(link_or_doc) -> str:
+    """Extract string ID from a Beanie Link reference or Document without fetching."""
+    # Already a fetched document
+    if hasattr(link_or_doc, 'id') and not hasattr(link_or_doc, 'ref'):
+        return str(link_or_doc.id)
+    # Beanie Link with DBRef
+    try:
+        return str(link_or_doc.ref.id)
+    except AttributeError:
+        pass
+    try:
+        return str(link_or_doc.to_ref().id)
+    except Exception:
+        pass
+    return ""
 
 
 @api_router.get("/marketplace/cart/")
 async def get_cart_endpoint(current_user: User = Depends(get_current_user)):
-    cart = await Cart.find_one(Cart.user.id == current_user.id, fetch_links=True)
+    cart = await Cart.find_one(Cart.user.id == current_user.id)
     if not cart:
         cart = Cart(user=current_user, items=[])
         await cart.insert()
@@ -1329,16 +1366,20 @@ async def get_cart_endpoint(current_user: User = Depends(get_current_user)):
     total_cart_points = 0
 
     for item in cart.items:
-        product = await item.product.fetch()
-        if product:
-            total_points = item.quantity * product.points_price
-            total_cart_points += total_points
-            serialized_items.append({
-                "id": str(product.id),
-                "product": product,
-                "quantity": item.quantity,
-                "total_points": total_points
-            })
+        try:
+            product_id_str = _link_id(item.product)
+            product = await Product.get(product_id_str) if product_id_str else None
+            if product:
+                total_points = item.quantity * product.points_price
+                total_cart_points += total_points
+                serialized_items.append({
+                    "id": str(product.id),
+                    "product": _serialize_product(product),
+                    "quantity": item.quantity,
+                    "total_points": total_points
+                })
+        except Exception:
+            pass
 
     return {
         "id": str(cart.id),
@@ -1365,7 +1406,7 @@ async def add_to_cart_endpoint(
 
     existing_item = None
     for item in cart.items:
-        if str(item.product.ref.id) == data.product_id:
+        if _link_id(item.product) == data.product_id:
             existing_item = item
             break
 
@@ -1391,7 +1432,7 @@ async def remove_from_cart_endpoint(
     if not cart:
         raise HTTPException(status_code=404, detail="Cart not found")
 
-    cart.items = [item for item in cart.items if str(item.product.ref.id) != data.cart_item_id]
+    cart.items = [item for item in cart.items if _link_id(item.product) != data.cart_item_id]
     await cart.save()
     return await get_cart_endpoint(current_user)
 
@@ -1428,7 +1469,11 @@ async def redeem_cart_endpoint(current_user: User = Depends(get_current_user)):
     resolved_items = []
 
     for item in cart.items:
-        product = await item.product.fetch()
+        if isinstance(item.product, Product):
+            product = item.product
+        else:
+            pid = _link_id(item.product)
+            product = await Product.get(pid) if pid else None
         if not product:
             raise HTTPException(status_code=404, detail="One or more products no longer exist.")
         total_points_cost += product.points_price * item.quantity
@@ -1509,10 +1554,14 @@ async def redeem_cart_endpoint(current_user: User = Depends(get_current_user)):
 
 @api_router.get("/marketplace/redemption/history/")
 async def redemption_history_endpoint(current_user: User = Depends(get_current_user)):
-    redemptions = await Redemption.find(Redemption.user.id == current_user.id, fetch_links=True).sort("-created_at").to_list()
+    redemptions = await Redemption.find(Redemption.user.id == current_user.id).sort("-created_at").to_list()
     serialized = []
     for r in redemptions:
-        prod = await r.product.fetch()
+        if isinstance(r.product, Product):
+            prod = r.product
+        else:
+            pid = _link_id(r.product)
+            prod = await Product.get(pid) if pid else None
         serialized.append({
             "id": str(r.id),
             "user": str(current_user.id),
